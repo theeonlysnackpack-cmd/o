@@ -12,6 +12,8 @@ import { renderEntityGraph } from './records/entityGraph'
 import { requireTargetDeclaration, fcraBanner, jurisdictionRules, addToOptOut, wipeSession, noTosViolatingAutomationCheck } from './records/guardrails'
 import { LiveAssetTracker } from './tracking/liveAssets'
 import { formatCountdown } from './utils/time'
+import { DeckMap } from './map/deckMap'
+import { initSupabase, getSyncStatus, saveSupabaseConfig, clearSupabaseConfig, syncUpProfiles, syncUpDossiers, syncUpPreferences, enableCloudSync, disableCloudSync } from './pwa/supabase'
 
 function escapeHtml(s: string): string {
   return (s || '').replace(/[&<>"']/g, c => ({ '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;' } as any)[c])
@@ -26,6 +28,7 @@ function haversineDeg(lat1:number, lon1:number, lat2:number, lon2:number){
 const app = document.getElementById('app')!
 app.innerHTML = `
   <div id="canvas-container"></div>
+  <div id="deck-container" style="position:absolute;inset:0;z-index:1;display:none;background:#070a12"></div>
   <div id="globe-tooltip"></div>
   <div class="topbar">
     <div class="brand">
@@ -36,6 +39,7 @@ app.innerHTML = `
       <div id="staleness-badge" class="badge"><span class="dot"></span><span id="staleness-text">FETCHING TLEs...</span></div>
       <div id="countdown-badge" class="badge"><span class="mono" id="countdown-text">--:--:--</span></div>
       <button id="btn-refresh" class="icon-btn">⟳ Force Refresh</button>
+      <button id="btn-2d-toggle" class="icon-btn">🗺️ 2D Map (deck.gl)</button>
       <button id="btn-geoloc" class="icon-btn">📍 My Location</button>
     </div>
     <div class="top-right">
@@ -176,14 +180,45 @@ const voicePanelEl = document.getElementById('voice-panel')!
 // Worker
 const worker = new Worker(new URL('./sat/worker.ts', import.meta.url), { type:'module' })
 let tleEntries: TLEEntry[] = []
-let positionsMap = new Map<string, { x:number,y:number,z:number, lat:number,lon:number,alt:number, vx:number,vy:number,vz:number }>()
+let positionsMap = new Map<string, { id:string, x:number,y:number,z:number, lat:number,lon:number,alt:number, vx:number,vy:number,vz:number }>()
 
-// Globe
+// Globe + deck.gl 2D map
+const deckContainer = document.getElementById('deck-container')!
 const globe = new Globe(canvasContainer, worker)
+const deckMap = new DeckMap(deckContainer)
 globe.onSatClickCb((id)=>{
   store.patch({ focusedSatId:id, trackedSatId:id })
   worker.postMessage({ type:'computeOrbit', id, steps: 90 })
 })
+deckMap.onClick((id)=>{
+  store.patch({ focusedSatId:id, trackedSatId:id })
+  globe.focusOnSat(id)
+  worker.postMessage({ type:'computeOrbit', id, steps: 120 })
+})
+
+// 2D toggle
+document.getElementById('btn-2d-toggle')?.addEventListener('click', ()=>{
+  const now2d = deckMap.toggle()
+  const btn=document.getElementById('btn-2d-toggle')!
+  btn.textContent = now2d ? '🌍 3D Globe' : '🗺️ 2D Map (deck.gl)'
+  btn.classList.toggle('active', now2d)
+  if(now2d){
+    // sync current positions to deck
+    const list = Array.from(positionsMap.values()).map(p=>({
+      id: p.id, lat: p.lat, lon: p.lon, alt: p.alt,
+      name: tleEntries.find(e=>e.id===p.id)?.name,
+      group: tleEntries.find(e=>e.id===p.id)?.group
+    }))
+    deckMap.updateSatellites(list)
+  }
+  // audit
+  auditLog({ action: now2d?'VIEW_2D_DECKGL':'VIEW_3D_GLOBE' }).catch(()=>{})
+})
+
+// Initialize supabase (optional, backendless by default)
+initSupabase().then(client=>{
+  console.log('[ORBITAL] Supabase', client?'enabled':'backendless')
+}).catch(()=>{})
 
 // Layers wiring (clone to avoid mutating state)
 document.querySelectorAll<HTMLInputElement>('[data-layer]').forEach(inp=>{
@@ -245,9 +280,17 @@ document.getElementById('btn-clear-focus')?.addEventListener('click', ()=>{
   store.patch({ focusedSatId: undefined, trackedSatId: undefined })
   focusMetricsEl.innerHTML=`<div class="small">No satellite selected. Click a point or use search. Try voice: “Focus on ISS”</div>`
 })
+function flyToBoth(lat:number, lon:number, alt:number=3.4){
+  try{ globe.flyTo(lat, lon, alt) }catch{}
+  try{ if(deckMap.getVisible()) deckMap.flyTo(lat, lon, alt>3?3:alt) }catch{}
+  // also if deck not visible, update its viewState for next time
+  try{ if(!deckMap.getVisible()) (deckMap as any).viewState = { ...(deckMap as any).viewState, latitude: lat, longitude: lon } }catch{}
+}
+
 try{
-  const ro = new ResizeObserver(()=> globe.resize())
+  const ro = new ResizeObserver(()=> { globe.resize(); deckMap.resize() })
   ro.observe(canvasContainer)
+  ro.observe(deckContainer)
 }catch{}
 
 function renderFocusMetrics(){
@@ -298,7 +341,7 @@ renderCamList()
 
 function openWebcam(pin: typeof CITY_HOTSPOTS[0]){
   store.patch({ activeWebcam: pin, fixedLocation:{ lat:pin.lat, lon:pin.lon, name:pin.name }, cameraMode:'fixed' })
-  globe.flyTo(pin.lat, pin.lon, 3.4)
+  flyToBoth(pin.lat, pin.lon, 3.4)
   worker.postMessage({ type:'computePasses', lat:pin.lat, lon:pin.lon, altKm:0.02, hours:2 })
 
   pipContainer.classList.add('open')
@@ -328,7 +371,7 @@ document.querySelectorAll('[data-preset]').forEach(btn=>{
     if(preset==='free'){ (globe as any).controls.autoRotate=false; store.patch({ cameraMode:'free' }) }
     if(preset==='cinematic'){ (globe as any).controls.autoRotate=true }
     if(preset==='fixed' && store.get().fixedLocation){
-      globe.flyTo(store.get().fixedLocation!.lat, store.get().fixedLocation!.lon, 3.4)
+      flyToBoth(store.get().fixedLocation!.lat, store.get().fixedLocation!.lon, 3.4)
     }
   })
 })
@@ -650,14 +693,34 @@ async function renderRight(tab:string){
     const db=await getDB()
     const audits=(await db.getAll('audit')).sort((a,b)=>b.ts-a.ts).slice(0,100)
     const optouts=await db.getAll('optout')
+    const syncStatus = getSyncStatus()
     rightContentEl.innerHTML=`
       <div class="col" style="gap:10px">
         <div style="font-weight:800">Guardrails — Ship This or Tool Is Indefensible</div>
         <div class="small">Target declaration gate, immutable audit log, session retention + one-click wipe, FCRA firewall, jurisdiction rules, opt-out registry, no ToS-violating automation.</div>
         <div class="row"><button id="btn-wipe" class="icon-btn" style="border-color:var(--red);color:var(--red)">🔥 One-Click Wipe Local</button><button id="btn-add-optout" class="icon-btn">Add Opt-Out</button></div>
+
+        <div style="border:1px solid var(--border);border-radius:10px;padding:10px;background:#0e162a">
+          <div style="font-weight:700">Supabase Sync Adapter (optional, backendless by default)</div>
+          <div class="small">Optional cloud sync for saved views, camera pins, preferences. 100% backendless out of the box. Enable only if you explicitly opt-in. Face templates never leave device unless biometric opt-in + encryption.</div>
+          <div class="small mono" style="margin-top:6px">Status: ${syncStatus.enabled?'enabled':'backendless'} • URL: ${escapeHtml(syncStatus.url||'not set')} • OptIn: ${syncStatus.optIn} • Biometric: ${syncStatus.biometricOptIn}</div>
+          <div class="row" style="margin-top:6px;gap:6px">
+            <input id="supa-url" class="input" placeholder="https://xyz.supabase.co" style="flex:1" value="${escapeHtml(syncStatus.url||'')}" />
+            <input id="supa-key" class="input" placeholder="anon key" style="flex:1" />
+          </div>
+          <div class="row" style="margin-top:6px;gap:6px">
+            <button id="btn-supa-save" class="icon-btn">Save Config</button>
+            <button id="btn-supa-enable" class="icon-btn">Enable Cloud Sync (opt-in)</button>
+            <button id="btn-supa-disable" class="icon-btn">Disable</button>
+            <button id="btn-supa-sync" class="icon-btn">Sync Up Now</button>
+          </div>
+          <div class="small mono" id="supa-status" style="margin-top:6px">Idle</div>
+          <div class="small">Tables needed: orbital_profiles (id, name, created_at, language, prefs, descriptor), orbital_dossiers, orbital_prefs. RLS: user_id = auth.uid(). See supabase/README.</div>
+        </div>
+
         <div><strong>Opt-Out Registry • ${optouts.length}</strong><div class="small">${optouts.map(o=>escapeHtml(o.name)).join(', ')||'empty'}</div></div>
         <div><strong>Jurisdiction Rules</strong><div class="small">${jurisdictionRules('US').map(escapeHtml).join(' • ')}<br/>EU: ${jurisdictionRules('EU').map(escapeHtml).join(' • ')}<br/>IL BIPA: ${jurisdictionRules('US-IL').map(escapeHtml).join(' • ')}</div></div>
-        <div><strong>Audit Log • Immutable • ${audits.length}</strong><div class="list" style="max-height:36vh">${audits.map(a=>`<div class="list-item"><span class="mono">${escapeHtml(new Date(a.ts).toLocaleTimeString())} ${escapeHtml(a.action)} ${escapeHtml(a.target||'')}</span><span class="small">${(a.sources||[]).map(escapeHtml).join(',')} </span></div>`).join('')}</div></div>
+        <div><strong>Audit Log • Immutable • ${audits.length}</strong><div class="list" style="max-height:28vh">${audits.map(a=>`<div class="list-item"><span class="mono">${escapeHtml(new Date(a.ts).toLocaleTimeString())} ${escapeHtml(a.action)} ${escapeHtml(a.target||'')}</span><span class="small">${(a.sources||[]).map(escapeHtml).join(',')} </span></div>`).join('')}</div></div>
         <div class="small mono">No ToS-violating automation: ${escapeHtml((()=>{ try { return JSON.stringify(noTosViolatingAutomationCheck()); } catch { return 'policy: single-session, human-in-loop, no captcha busting'; } })())}</div>
       </div>
     `
@@ -671,6 +734,40 @@ async function renderRight(tab:string){
     document.getElementById('btn-add-optout')?.addEventListener('click', async ()=>{
       const name=prompt('Name to opt-out (exact match blocks future searches):')
       if(name){ await addToOptOut(name); renderRight('audit') }
+    })
+    // Supabase wiring
+    document.getElementById('btn-supa-save')?.addEventListener('click', async ()=>{
+      const url=(document.getElementById('supa-url') as HTMLInputElement).value.trim()
+      const key=(document.getElementById('supa-key') as HTMLInputElement).value.trim()
+      if(!url || !key){ alert('URL and anon key required'); return }
+      try{
+        await saveSupabaseConfig(url,key)
+        const el=document.getElementById('supa-status'); if(el) el.textContent='Saved config, Supabase enabled (backendless fallback if fails)'
+        renderRight('audit')
+      }catch(e:any){ alert('Save failed: '+e.message) }
+    })
+    document.getElementById('btn-supa-enable')?.addEventListener('click', async ()=>{
+      try{
+        const res=await enableCloudSync(false)
+        const el=document.getElementById('supa-status'); if(el) el.textContent='Cloud sync enabled (opt-in). Profiles not biometric unless separate opt-in.'
+        console.log('enable',res)
+        renderRight('audit')
+      }catch(e:any){ alert(e.message) }
+    })
+    document.getElementById('btn-supa-disable')?.addEventListener('click', ()=>{
+      disableCloudSync()
+      clearSupabaseConfig()
+      const el=document.getElementById('supa-status'); if(el) el.textContent='Disabled — back to 100% backendless'
+      renderRight('audit')
+    })
+    document.getElementById('btn-supa-sync')?.addEventListener('click', async ()=>{
+      const el=document.getElementById('supa-status'); if(el) el.textContent='Syncing...'
+      try{
+        const p=await syncUpProfiles()
+        const d=await syncUpDossiers()
+        const pref=await syncUpPreferences()
+        if(el) el.textContent=`Sync result profiles:${JSON.stringify(p)} dossiers:${JSON.stringify(d)} prefs:${JSON.stringify(pref)}`
+      }catch(e:any){ if(el) el.textContent='Sync failed: '+e.message }
     })
 
   } else if(tab==='face'){
@@ -775,6 +872,15 @@ worker.onmessage = (e)=>{
     for(const p of positions){ map.set(p.id, p) }
     positionsMap = map
     globe.updatePositions(positions)
+    // Update deck.gl 2D map if visible (throttled)
+    if(deckMap.getVisible()){
+      const list = positions.map((p:any)=>({
+        id: p.id, lat: p.lat, lon: p.lon, alt: p.alt,
+        name: tleEntries.find(entry=>entry.id===p.id)?.name,
+        group: tleEntries.find(entry=>entry.id===p.id)?.group
+      }))
+      deckMap.updateSatellites(list)
+    }
     updateOverhead()
   } else if(type==='orbit'){
     const { path } = e.data
@@ -858,7 +964,7 @@ document.getElementById('btn-geoloc')?.addEventListener('click', ()=>{
   navigator.geolocation.getCurrentPosition(pos=>{
     userLocation={ lat:pos.coords.latitude, lon:pos.coords.longitude }
     geoStatusEl.textContent=`${userLocation.lat.toFixed(3)}, ${userLocation.lon.toFixed(3)}`
-    globe.flyTo(userLocation!.lat, userLocation!.lon, 2.8)
+    flyToBoth(userLocation!.lat, userLocation!.lon, 2.8)
     worker.postMessage({ type:'computePasses', lat:userLocation!.lat, lon:userLocation!.lon, altKm:0 })
     updateOverhead()
   }, err=>{
