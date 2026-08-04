@@ -16,7 +16,7 @@ export type WebcamPin = { id:string, name:string, lat:number, lon:number, url:st
 
 export type AppState = {
   time: Date
-  timeScale: number // 1 = realtime, 10 = 10x etc
+  timeScale: number
   tlesFetchedAt?: number
   nextRefreshAt?: number
   satCount: number
@@ -56,14 +56,11 @@ class Store {
   private timeInterval?: number
 
   constructor(){
-    // Tick time
     this.timeInterval = window.setInterval(()=>{
-      this.state.time = new Date(Date.now() + (this.state.time.getTime() - Date.now())*0 /* keep sync? */)
-      if(this.state.timeScale !== 1){
-        // timeScale handling is in render loop; here keep real
-      }
+      // keep time in sync with real UTC
+      this.state.time = new Date()
       this.emit()
-    }, 1000)
+    }, 1000) as any
     window.addEventListener('online', ()=> this.patch({isOffline:false}))
     window.addEventListener('offline', ()=> this.patch({isOffline:true}))
   }
@@ -73,8 +70,16 @@ class Store {
     this.state = { ...this.state, ...p }
     this.emit()
   }
-  subscribe(fn:Listener){ this.listeners.add(fn); fn(this.state); return ()=>this.listeners.delete(fn) }
-  private emit(){ for(const l of this.listeners) l(this.state) }
+  subscribe(fn:Listener){
+    this.listeners.add(fn)
+    try{ fn(this.state) }catch(e){ console.warn('Store listener error', e) }
+    return ()=>this.listeners.delete(fn)
+  }
+  private emit(){
+    for(const l of this.listeners){
+      try{ l(this.state) }catch(e){ console.warn('Store emit error', e) }
+    }
+  }
 }
 
 export const store = new Store()

@@ -3,33 +3,34 @@ import * as THREE from 'three'
 export class TextureManager {
   private loader = new THREE.TextureLoader()
   baseTexture?: THREE.Texture
-  cloudTexture?: THREE.Texture
   goesTexture?: THREE.Texture
-  nightTexture?: THREE.Texture
-  currentEarthMat?: THREE.MeshPhongMaterial | THREE.ShaderMaterial
 
-  constructor(private scene: THREE.Scene) {}
+  constructor(private scene?: THREE.Scene){
+    this.loader.setCrossOrigin('anonymous')
+  }
 
-  async loadBase(){
-    // Low-res first
-    const lowRes = 'https://unpkg.com/three-globe/example/img/earth-blue-marble.jpg'
-    const darkRes = 'https://unpkg.com/three-globe/example/img/earth-night.jpg'
-    const fallbackCanvas = this.createFallbackEarthCanvas()
-    const fallbackTex = new THREE.CanvasTexture(fallbackCanvas)
+  async loadBase(): Promise<THREE.Texture>{
+    const fallback = this.createFallbackEarthCanvas()
+    const fallbackTex = new THREE.CanvasTexture(fallback)
     fallbackTex.colorSpace = THREE.SRGBColorSpace
 
-    try{
-      const tex = await this.loader.loadAsync(lowRes)
-      tex.colorSpace = THREE.SRGBColorSpace
-      tex.anisotropy = 4
-      this.baseTexture = tex
-      return tex
-    }catch{
-      console.warn('Base texture load failed, using fallback')
-      this.baseTexture = fallbackTex
-      // Also try github raw? Keep fallback
-      return fallbackTex
+    const candidates = [
+      'https://unpkg.com/three-globe@2.30.0/example/img/earth-blue-marble.jpg',
+      'https://unpkg.com/three-globe/example/img/earth-blue-marble.jpg',
+      'https://cdn.jsdelivr.net/npm/three-globe/example/img/earth-blue-marble.jpg'
+    ]
+    for(const url of candidates){
+      try{
+        const tex = await this.loader.loadAsync(url)
+        tex.colorSpace = THREE.SRGBColorSpace
+        tex.anisotropy = 4
+        this.baseTexture = tex
+        return tex
+      }catch{ /* continue */ }
     }
+    console.warn('[Texture] base load failed, using procedural fallback')
+    this.baseTexture = fallbackTex
+    return fallbackTex
   }
 
   createFallbackEarthCanvas(){
@@ -38,20 +39,21 @@ export class TextureManager {
     const ctx=c.getContext('2d')!
     const grad=ctx.createLinearGradient(0,0,0,512)
     grad.addColorStop(0,'#0d213f')
-    grad.addColorStop(0.5,'#13315c')
+    grad.addColorStop(0.45,'#14325e')
     grad.addColorStop(1,'#0a1a33')
     ctx.fillStyle=grad
     ctx.fillRect(0,0,1024,512)
-    // continents rough
-    ctx.fillStyle='#1b3a5f'
-    for(let i=0;i<30;i++){
+    ctx.fillStyle='#17375f'
+    // pseudo continents
+    const shapes=[
+      {x:180,y:140,w:120,h:90},{x:320,y:200,w:80,h:60},{x:500,y:120,w:200,h:160},{x:720,y:220,w:100,h:80},{x:150,y:300,w:140,h:70},{x:650,y:320,w:180,h:90}
+    ]
+    for(const s of shapes){
       ctx.beginPath()
-      const x=Math.random()*1024, y=Math.random()*512, r=20+Math.random()*80
-      ctx.arc(x,y,r,0,Math.PI*2)
+      ctx.ellipse(s.x,s.y,s.w,s.h,0,0,Math.PI*2)
       ctx.fill()
     }
-    // grid lines
-    ctx.strokeStyle='rgba(94,225,255,0.08)'
+    ctx.strokeStyle='rgba(94,225,255,0.07)'
     ctx.lineWidth=1
     for(let lon=0;lon<1024;lon+=64){ ctx.beginPath(); ctx.moveTo(lon,0); ctx.lineTo(lon,512); ctx.stroke() }
     for(let lat=0;lat<512;lat+=64){ ctx.beginPath(); ctx.moveTo(0,lat); ctx.lineTo(1024,lat); ctx.stroke() }
@@ -59,59 +61,41 @@ export class TextureManager {
   }
 
   async attemptGOES(): Promise<THREE.Texture | null>{
-    // Try to fetch latest GOES image with time rounding
-    const now = new Date()
-    // Round to nearest 10 min
-    const tryTimes: Date[]=[]
-    for(let i=0;i<6;i++){
-      const d=new Date(now.getTime()-i*10*60*1000)
-      d.setUTCMinutes(Math.floor(d.getUTCMinutes()/10)*10,0,0)
-      tryTimes.push(d)
-    }
-    for(const dt of tryTimes){
-      const yyyy=dt.getUTCFullYear()
-      const mm=String(dt.getUTCMonth()+1).padStart(2,'0')
-      const dd=String(dt.getUTCDate()).padStart(2,'0')
-      const hh=String(dt.getUTCHours()).padStart(2,'0')
-      const min=String(dt.getUTCMinutes()).padStart(2,'0')
-      // Pattern: https://cdn.star.nesdis.noaa.gov/GOES16/ABI/FD/GEOCOLOR/20240501/GOES16-FD-GEOCOLOR-202405011200_... Actually filename is complex.
-      // Simplified: try full-disk jpeg: https://cdn.star.nesdis.noaa.gov/GOES18/ABI/FD/GEOCOLOR/1808x1808.jpg (latest)
-      const urls=[
-        `https://cdn.star.nesdis.noaa.gov/GOES18/ABI/FD/GEOCOLOR/1808x1808.jpg`,
-        `https://cdn.star.nesdis.noaa.gov/GOES16/ABI/FD/GEOCOLOR/1808x1808.jpg`,
-        `https://rammb-slider.cira.colostate.edu/data/imagery/20240501/goes-16---full_disk---geocolor---${yyyy}${mm}${dd}${hh}${min}00/images/01/00/01_00001.png`
-      ]
-      for(const url of urls){
-        try{
-          const res = await fetch(url, { mode:'no-cors' }) // no-cors will be opaque but texture loader may still need cors; we try loader with crossOrigin
-          // Try loader directly
-          const tex = await this.loader.loadAsync(url)
-          tex.colorSpace=THREE.SRGBColorSpace
-          console.log(`[GOES] loaded ${url}`)
-          this.goesTexture=tex
-          return tex
-        }catch{}
+    // Try direct image URLs known to be CORS-enabled? GOES CDN usually blocks CORS, so we expect fallback.
+    const urls=[
+      'https://cdn.star.nesdis.noaa.gov/GOES18/ABI/FD/GEOCOLOR/1808x1808.jpg',
+      'https://cdn.star.nesdis.noaa.gov/GOES16/ABI/FD/GEOCOLOR/1808x1808.jpg',
+    ]
+    for(const url of urls){
+      try{
+        const tex = await this.loader.loadAsync(url)
+        tex.colorSpace=THREE.SRGBColorSpace
+        console.log(`[GOES] live loaded ${url}`)
+        this.goesTexture=tex
+        return tex
+      }catch(e){
+        console.warn(`[GOES] failed ${url}`, (e as any)?.message||e)
       }
     }
-    // fallback: use a procedural live cloud texture that moves
     console.log('[GOES] falling back to procedural clouds')
     return null
   }
 
   createLiveCloudCanvasTexture(){
     const c=document.createElement('canvas')
-    c.width=2048; c.height=1024
+    c.width=1024; c.height=512
     const ctx=c.getContext('2d')!
-    // transparent base
     ctx.clearRect(0,0,c.width,c.height)
-    // draw moving cloud noise
-    for(let i=0;i<800;i++){
+    // soft cloud blobs
+    for(let i=0;i<400;i++){
       const x=Math.random()*c.width
       const y=Math.random()*c.height
-      const r=10+Math.random()*40
-      ctx.fillStyle=`rgba(255,255,255,${0.2+Math.random()*0.5})`
+      const rx=8+Math.random()*36
+      const ry=rx*0.6
+      const alpha=0.12+Math.random()*0.35
+      ctx.fillStyle=`rgba(255,255,255,${alpha})`
       ctx.beginPath()
-      ctx.ellipse(x,y,r,r*0.6,Math.random()*Math.PI,0,Math.PI*2)
+      ctx.ellipse(x,y,rx,ry,Math.random()*Math.PI,0,Math.PI*2)
       ctx.fill()
     }
     const tex=new THREE.CanvasTexture(c)

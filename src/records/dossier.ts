@@ -1,23 +1,24 @@
-import { getDB, auditLog, Dossier, ChecklistItem, Fact, TimelineEvent } from '../pwa/db'
+import { getDB, auditLog, Dossier, ChecklistItem, Fact } from '../pwa/db'
 import { generateChecklist } from './catalog'
 
 export async function createDossier(target:string, jurisdiction:string, opts?:any): Promise<Dossier>{
-  const id=Math.random().toString(36).slice(2)
+  const id=Math.random().toString(36).slice(2) + Date.now().toString(36)
   const checklist=generateChecklist(target, jurisdiction, opts)
+  const safeTarget = target.trim()
   const dossier:Dossier={
     id,
-    target,
+    target: safeTarget,
     jurisdiction,
     createdAt:Date.now(),
     checklist,
     facts:[],
-    graphNodes:[ { data:{ id: target, label: target, type:'person', confidence:'primary' } } ],
+    graphNodes:[ { data:{ id: safeTarget, label: safeTarget, type:'person', confidence:'primary' } } ],
     graphEdges:[],
     timeline:[]
   }
   const db=await getDB()
   await db.put('dossiers', dossier)
-  await auditLog({ action:'DOSSIER_CREATE', target, meta:{ id, jurisdiction } })
+  await auditLog({ action:'DOSSIER_CREATE', target: safeTarget, meta:{ id, jurisdiction } }).catch(()=>{})
   return dossier
 }
 export async function getDossier(id:string){
@@ -32,17 +33,34 @@ export async function addFact(dossierId:string, fact:Omit<Fact,'id'>){
   const db=await getDB()
   const dos=await db.get('dossiers', dossierId)
   if(!dos) throw new Error('Dossier not found')
-  const newFact:Fact={ id: Math.random().toString(36).slice(2), ...fact }
-  dos.facts.push(newFact)
-  // auto add to graph
-  dos.graphNodes.push({ data:{ id:fact.value, label:fact.value, type:fact.field, confidence:fact.confidence } })
-  dos.graphEdges.push({ data:{ id: `${dos.target}-${fact.value}`, source: dos.target, target: fact.value, label: fact.field, confidence: fact.confidence, verification: fact.verification } })
-  // timeline if dated
+  const newFact:Fact={ id: Math.random().toString(36).slice(2)+Date.now().toString(36), ...fact }
+
+  // dedupe by field+value
+  const exists = dos.facts.find(f=> f.field===fact.field && f.value===fact.value)
+  if(exists){
+    // update existing
+    Object.assign(exists, fact)
+  } else {
+    dos.facts.push(newFact)
+  }
+
+  // graph dedupe
+  const nodeId = fact.value
+  const hasNode = dos.graphNodes.some((n:any)=> n.data.id===nodeId)
+  if(!hasNode){
+    dos.graphNodes.push({ data:{ id:nodeId, label:fact.value.slice(0,80), type:fact.field, confidence:fact.confidence } })
+  }
+  const edgeId = `${dos.target}::${fact.field}::${fact.value}`
+  const hasEdge = dos.graphEdges.some((e:any)=> e.data.id===edgeId)
+  if(!hasEdge){
+    dos.graphEdges.push({ data:{ id: edgeId, source: dos.target, target: nodeId, label: fact.field, confidence: fact.confidence, verification: fact.verification } })
+  }
+
   if(fact.timestamp){
     dos.timeline.push({ id:newFact.id, date:new Date(fact.timestamp).toISOString(), title:`${fact.field}: ${fact.value}`, source:fact.source, description:fact.source })
   }
   await db.put('dossiers', dos)
-  await auditLog({ action:'FACT_ADD', target:dos.target, sources:[fact.source], meta:{ dossierId, factId:newFact.id } })
+  await auditLog({ action:'FACT_ADD', target:dos.target, sources:[fact.source], meta:{ dossierId, factId:newFact.id } }).catch(()=>{})
   return dos
 }
 export async function updateChecklistItem(dossierId:string, sourceId:string, status:ChecklistItem['status']){
@@ -61,17 +79,19 @@ export function confidenceScore(fact:Fact): number{
 
 export async function exportDossierJSON(id:string){
   const dossier=await getDossier(id)
+  if(!dossier) throw new Error('No dossier')
   return JSON.stringify(dossier, null, 2)
 }
 
 export async function generatePDFReport(id:string){
-  // Use jsPDF dynamically
   const { jsPDF } = await import('jspdf')
   const dossier=await getDossier(id)
   if(!dossier) throw new Error('No dossier')
   const doc=new jsPDF()
-  doc.setFontSize(18)
-  doc.text(`OSINT Dossier — ${dossier.target}`, 10, 15)
+  doc.setFontSize(16)
+  // sanitize for PDF (avoid special chars)
+  const safeTarget = dossier.target.replace(/[^\x20-\x7E]/g,'_')
+  doc.text(`OSINT Dossier - ${safeTarget}`, 10, 15)
   doc.setFontSize(10)
   doc.text(`Jurisdiction: ${dossier.jurisdiction} | Created: ${new Date(dossier.createdAt).toLocaleString()}`, 10, 22)
   doc.text(`FCRA FIREWALL: This data cannot support employment, credit, insurance, or housing decisions.`, 10, 28)
@@ -79,18 +99,21 @@ export async function generatePDFReport(id:string){
   doc.setFontSize(12)
   doc.text('Facts & Sources', 10, y); y+=6
   doc.setFontSize(9)
-  dossier.facts.forEach(f=>{
+  dossier.facts.slice(0,120).forEach(f=>{
     if(y>270){ doc.addPage(); y=12 }
-    doc.text(`- [${f.verification}/${f.confidence} ${confidenceScore(f)}%] ${f.field}: ${f.value} (${f.source}) ${f.sourceUrl||''}`, 10, y)
+    const line = `- [${f.verification}/${f.confidence} ${confidenceScore(f)}%] ${f.field}: ${f.value} (${f.source})`.slice(0,110)
+    try{ doc.text(line, 10, y) }catch{}
     y+=5
   })
   y+=4
+  if(y>250){ doc.addPage(); y=12 }
   doc.setFontSize(12)
   doc.text('Timeline',10,y); y+=6
   doc.setFontSize(9)
-  dossier.timeline.sort((a,b)=>a.date.localeCompare(b.date)).forEach(ev=>{
+  dossier.timeline.sort((a,b)=>a.date.localeCompare(b.date)).slice(0,80).forEach(ev=>{
     if(y>270){ doc.addPage(); y=12 }
-    doc.text(`${ev.date.slice(0,10)} — ${ev.title} [${ev.source}]`,10,y); y+=5
+    try{ doc.text(`${ev.date.slice(0,10)} - ${ev.title.slice(0,90)} [${ev.source}]`.slice(0,115),10,y) }catch{}
+    y+=5
   })
   y+=4
   doc.setFontSize(8)

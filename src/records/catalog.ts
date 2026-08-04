@@ -54,13 +54,22 @@ export const EXCLUDED = [
 ]
 
 export function generateChecklist(target:string, jurisdiction:string, opts?:{ state?:string, county?:string }){
-  const state = opts?.state || 'CA'
-  const county = opts?.county || 'Los Angeles'
+  const state = (opts?.state || 'CA').trim()
+  const county = (opts?.county || 'Los Angeles').trim()
+  const safeTarget = target.trim().slice(0,120)
+  const encodedTarget = encodeURIComponent(safeTarget)
   return RECORDS_CATALOG
     .filter(s=> jurisdiction==='global' ? true : s.jurisdiction===jurisdiction || s.jurisdiction==='federal' || s.jurisdiction==='global' || s.jurisdiction==='state' )
     .map(s=>{
       let url=s.url
-      let query=s.queryTemplate.replace('{target}', encodeURIComponent(target)).replace('{state}', state).replace('{county}', county)
+      // replace all placeholders
+      let query=s.queryTemplate
+        .replaceAll('{target}', encodedTarget)
+        .replaceAll('{state}', encodeURIComponent(state))
+        .replaceAll('{county}', encodeURIComponent(county))
+        .replaceAll('{domain}', encodedTarget)
+        .replaceAll('{nNumber}', encodedTarget)
+        .replaceAll('{imo}', encodedTarget)
       if(query.startsWith('http')) url=query
       return {
         sourceId:s.id,

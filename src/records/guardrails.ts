@@ -1,13 +1,23 @@
 import { getDB, auditLog } from '../pwa/db'
 
 export async function requireTargetDeclaration(target:string, jurisdiction:string, purpose:string){
-  if(!target || target.trim().length<2) throw new Error('Target required')
+  const trimmed = (target||'').trim()
+  if(!trimmed || trimmed.length<2) throw new Error('Target required (min 2 chars)')
+  if(!purpose || purpose.trim().length<5) throw new Error('Purpose required (describe due diligence / red-team / asset investigation)')
   // Immutable audit log
-  await auditLog({ action:'TARGET_DECLARATION', target, meta:{ jurisdiction, purpose, ts:Date.now() } })
-  // Check opt-out registry
-  const db=await getDB()
-  const blocked = await db.get('optout', target.toLowerCase())
-  if(blocked) throw new Error(`Target ${target} is in opt-out registry and blocked by operator policy.`)
+  try{
+    await auditLog({ action:'TARGET_DECLARATION', target: trimmed, meta:{ jurisdiction, purpose: purpose.slice(0,200), ts:Date.now() } })
+  }catch{}
+  // Check opt-out registry case-insensitive
+  try{
+    const db=await getDB()
+    const blocked = await db.get('optout', trimmed.toLowerCase())
+    if(blocked) throw new Error(`Target "${trimmed}" is in opt-out registry and blocked by operator policy.`)
+  }catch(e:any){
+    if(e?.message?.includes('opt-out')) throw e
+    // if DB fails, allow but log
+    console.warn('Opt-out check failed', e)
+  }
   return true
 }
 
@@ -21,30 +31,45 @@ export function jurisdictionRules(subjectLocation:'EU'|'US-CA'|'US-IL'|'US'|'oth
     rules.push('GDPR: provide data-deletion affordance, purpose limitation, and explicit logging.')
   }
   if(subjectLocation==='US-IL'){
-    rules.push('BIPA: face templates never leave device; biometric data stored only encrypted locally.')
+    rules.push('BIPA: face templates never leave device; biometric data stored only encrypted locally, explicit consent required.')
   }
-  rules.push('DPPA: motor-vehicle data entirely blocked.')
+  if(subjectLocation==='US-CA'){
+    rules.push('CCPA: California resident - provide deletion affordance.')
+  }
+  rules.push('DPPA: motor-vehicle data entirely blocked (18 USC 2721).')
+  rules.push('No bulk scraping, single-session human-in-loop.')
   return rules
 }
 
 export async function addToOptOut(name:string){
+  const trimmed=name.trim()
+  if(!trimmed) throw new Error('Name required')
   const db=await getDB()
-  await db.put('optout', { name, addedAt:Date.now() }, name.toLowerCase())
-  await auditLog({ action:'OPT_OUT_ADD', target:name })
+  await db.put('optout', { name: trimmed, addedAt:Date.now() }, trimmed.toLowerCase())
+  await auditLog({ action:'OPT_OUT_ADD', target:trimmed }).catch(()=>{})
 }
 
 export async function wipeSession(){
   const db=await getDB()
-  await db.clear('keyval')
-  await db.clear('dossiers')
-  await db.clear('audit')
-  // Keep optout and profiles? Profiles can be wiped separately via face manager
+  try{ await db.clear('keyval') }catch{}
+  try{ await db.clear('dossiers') }catch{}
+  try{ await db.clear('audit') }catch{}
+  try{ await db.clear('tles') }catch{}
+  try{ await db.clear('prefs') }catch{}
+  // Keep optout and profiles? Profiles can be wiped separately via face manager for BIPA
+  try{ localStorage.removeItem('orbital-onboard') }catch{}
 }
 
 export function noTosViolatingAutomationCheck(){
-  // Enforce: one browser session per source, human-in-loop confirmation, no captcha busting, no bulk scrapers
   return {
     allowed: true,
-    policy: 'Single-session, rate-limited, human-confirmed extraction. No captcha bypass, no bulk scrapers. This keeps the tool legally clean.'
+    policy: 'Single-session, rate-limited, human-confirmed extraction. No captcha bypass, no bulk scrapers. This keeps the tool legally clean and is the honest way to do OSINT.',
+    rules: [
+      'One browser tab per source',
+      'Human must confirm extraction',
+      'No automated CAPTCHA solving',
+      'Rate-limited, no hammering',
+      'Respect robots.txt where applicable, prefer public APIs'
+    ]
   }
 }

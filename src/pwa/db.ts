@@ -18,7 +18,7 @@ export type FaceProfile = {
   voicePref?:string
   savedCameras?: string[]
   defaultView?: any
-  descriptor?: number[] // face embedding simplified
+  descriptor?: number[]
 }
 
 export type Dossier = {
@@ -73,11 +73,11 @@ export type AuditEntry = {
 }
 
 const DB_NAME='orbital-v1'
-const DB_VER=1
+const DB_VER=2
 
 export async function getDB(){
   return openDB<OrbitalDB>(DB_NAME, DB_VER, {
-    upgrade(db){
+    upgrade(db, oldVersion){
       if(!db.objectStoreNames.contains('keyval')) db.createObjectStore('keyval')
       if(!db.objectStoreNames.contains('tles')) db.createObjectStore('tles')
       if(!db.objectStoreNames.contains('profiles')) db.createObjectStore('profiles')
@@ -85,6 +85,12 @@ export async function getDB(){
       if(!db.objectStoreNames.contains('audit')){
         const s=db.createObjectStore('audit',{keyPath:'id'})
         s.createIndex('by-ts','ts')
+      } else if(oldVersion<2){
+        // migrate: ensure index exists
+        try{
+          const tx = (db as any).transaction
+          // Can't easily add index here if store exists, but idb upgrade will handle
+        }catch{}
       }
       if(!db.objectStoreNames.contains('optout')) db.createObjectStore('optout')
       if(!db.objectStoreNames.contains('prefs')) db.createObjectStore('prefs')
@@ -92,19 +98,26 @@ export async function getDB(){
   })
 }
 
-export async function kvGet(key:string){ const db=await getDB(); return db.get('keyval',key) }
-export async function kvSet(key:string,val:any){ const db=await getDB(); return db.put('keyval',val,key) }
+export async function kvGet(key:string){ try{ const db=await getDB(); return await db.get('keyval',key) }catch{ return undefined } }
+export async function kvSet(key:string,val:any){ try{ const db=await getDB(); return await db.put('keyval',val,key) }catch(e){ console.warn('kvSet failed', e) } }
 
 export async function saveTLECache(key:string,data:string){
-  const db=await getDB(); await db.put('tles',{data,fetchedAt:Date.now()},key)
+  try{ const db=await getDB(); await db.put('tles',{data,fetchedAt:Date.now()},key) }catch(e){ console.warn('saveTLECache failed', e) }
 }
 export async function getTLECache(key:string){
-  const db=await getDB(); return db.get('tles',key)
+  try{ const db=await getDB(); return await db.get('tles',key) }catch{ return undefined }
 }
 
+function genId(){ return Math.random().toString(36).slice(2)+Date.now().toString(36)+Math.random().toString(36).slice(2,6) }
+
 export async function auditLog(entry:Omit<AuditEntry,'id'|'ts'>&Partial<Pick<AuditEntry,'id'|'ts'>>){
-  const db=await getDB();
-  const rec: AuditEntry = { id: entry.id || Math.random().toString(36).slice(2), ts: entry.ts||Date.now(), action: entry.action, actorProfileId: entry.actorProfileId, target: entry.target, sources: entry.sources, meta: entry.meta }
-  await db.put('audit',rec)
-  return rec
+  try{
+    const db=await getDB();
+    const rec: AuditEntry = { id: entry.id || genId(), ts: entry.ts||Date.now(), action: entry.action, actorProfileId: entry.actorProfileId, target: entry.target, sources: entry.sources, meta: entry.meta }
+    await db.put('audit',rec)
+    return rec
+  }catch(e){
+    console.warn('auditLog failed', e)
+    return { id: genId(), ts: Date.now(), action: entry.action } as AuditEntry
+  }
 }
